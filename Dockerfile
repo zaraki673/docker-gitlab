@@ -1,18 +1,17 @@
-FROM sameersbn/ubuntu:14.04.20140818
+FROM sameersbn/debian:jessie.20141001
 MAINTAINER sameer@damagehead.com
 
-RUN add-apt-repository -y ppa:git-core/ppa \
- && add-apt-repository -y ppa:brightbox/ruby-ng \
- && add-apt-repository -y ppa:nginx/stable \
- && apt-get update \
- && apt-get install -y build-essential checkinstall cmake postgresql-client \
-      nginx git-core openssh-server mysql-server redis-server python2.7 python-docutils \
-      libmysqlclient-dev libpq-dev zlib1g-dev libyaml-dev libssl-dev \
-      libgdbm-dev libreadline-dev libncurses5-dev libffi-dev \
-      libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev \
-      ruby2.1 ruby2.1-dev \
- && gem install --no-ri --no-rdoc bundler \
- && rm -rf /var/lib/apt/lists/* # 20140818
+RUN apt-get update \
+ && apt-get install -y supervisor logrotate locales \
+      nginx openssh-server redis-tools mysql-client \
+      git-core postgresql-client ruby rubygems \
+      python2.7 python-docutils \
+      libmysqlclient18 libpq5 zlib1g libyaml-0-2 libssl1.0.0 \
+      libgdbm3 libreadline6 libncurses5 libffi6 \
+      libxml2 libxslt1.1 libcurl3 libicu52 \
+ && update-locale LANG=C.UTF-8 LC_MESSAGES=POSIX \
+ && gem install --no-document bundler \
+ && rm -rf /var/lib/apt/lists/* # 20140918
 
 COPY assets/setup/ /app/setup/
 RUN chmod 755 /app/setup/install

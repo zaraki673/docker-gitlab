@@ -1,8 +1,11 @@
 #!/bin/bash
 set -e
 
+trap appStop SIGINT SIGTERM
+
 GITLAB_INSTALL_DIR="/home/git/gitlab"
 GITLAB_DATA_DIR="/home/git/data"
+GITLAB_BACKUP_DIR="${GITLAB_BACKUP_DIR:-$GITLAB_DATA_DIR/backups}"
 GITLAB_SHELL_INSTALL_DIR="/home/git/gitlab-shell"
 
 SETUP_DIR="/app/setup"
@@ -11,6 +14,7 @@ USERCONF_TEMPLATES_DIR="${GITLAB_DATA_DIR}/config"
 
 GITLAB_HOST=${GITLAB_HOST:-localhost}
 GITLAB_PORT=${GITLAB_PORT:-}
+GITLAB_SSH_HOST=${GITLAB_SSH_HOST:-$GITLAB_HOST}
 GITLAB_SSH_PORT=${GITLAB_SSH_PORT:-$GITLAB_SHELL_SSH_PORT} # for backwards compatibility
 GITLAB_SSH_PORT=${GITLAB_SSH_PORT:-22}
 GITLAB_HTTPS=${GITLAB_HTTPS:-false}
@@ -22,6 +26,8 @@ GITLAB_USERNAME_CHANGE=${GITLAB_USERNAME_CHANGE:-true}
 GITLAB_PROJECTS_VISIBILITY=${GITLAB_PROJECTS_VISIBILITY:-private}
 GITLAB_RELATIVE_URL_ROOT=${GITLAB_RELATIVE_URL_ROOT:-}
 GITLAB_RESTRICTED_VISIBILITY=${GITLAB_RESTRICTED_VISIBILITY:-}
+GITLAB_WEBHOOK_TIMEOUT=${GITLAB_WEBHOOK_TIMEOUT:-10}
+GITLAB_GRAVATAR_ENABLED=${GITLAB_GRAVATAR_ENABLED:-true}
 
 SSL_SELF_SIGNED=${SSL_SELF_SIGNED:-false}
 SSL_CERTIFICATE_PATH=${SSL_CERTIFICATE_PATH:-$GITLAB_DATA_DIR/certs/gitlab.crt}
@@ -51,10 +57,9 @@ SIDEKIQ_CONCURRENCY=${SIDEKIQ_CONCURRENCY:-5}
 DB_TYPE=${DB_TYPE:-}
 DB_HOST=${DB_HOST:-}
 DB_PORT=${DB_PORT:-}
-DB_NAME=${DB_NAME:-gitlabhq_production}
-DB_USER=${DB_USER:-root}
+DB_NAME=${DB_NAME:-}
+DB_USER=${DB_USER:-}
 DB_PASS=${DB_PASS:-}
-DB_INIT=${DB_INIT:-}
 DB_POOL=${DB_POOL:-10}
 
 SMTP_DOMAIN=${SMTP_DOMAIN:-www.gmail.com}
@@ -80,6 +85,9 @@ LDAP_ALLOW_USERNAME_OR_EMAIL_LOGIN=${LDAP_ALLOW_USERNAME_OR_EMAIL_LOGIN:-}
 LDAP_BASE=${LDAP_BASE:-}
 LDAP_USER_FILTER=${LDAP_USER_FILTER:-}
 
+GITLAB_HTTPS_HSTS_ENABLED=${GITLAB_HTTPS_HSTS_ENABLED:-true}
+GITLAB_HTTPS_HSTS_MAXAGE=${GITLAB_HTTPS_HSTS_MAXAGE:-31536000}
+
 REDMINE_URL=${REDMINE_URL:-}
 JIRA_URL=${JIRA_URL:-}
 
@@ -101,8 +109,7 @@ if [ -n "${REDISIO_PORT_6379_TCP_ADDR}" ]; then
   REDIS_PORT=${REDIS_PORT:-${REDISIO_PORT_6379_TCP_PORT}}
 fi
 
-# fallback to using internal redis server
-REDIS_HOST=${REDIS_HOST:-localhost}
+# fallback to default redis port
 REDIS_PORT=${REDIS_PORT:-6379}
 
 # is a mysql or postgresql database linked?
@@ -112,22 +119,128 @@ if [ -n "${MYSQL_PORT_3306_TCP_ADDR}" ]; then
   DB_TYPE=${DB_TYPE:-mysql}
   DB_HOST=${DB_HOST:-${MYSQL_PORT_3306_TCP_ADDR}}
   DB_PORT=${DB_PORT:-${MYSQL_PORT_3306_TCP_PORT}}
+
+  # support for linked sameersbn/mysql image
+  DB_USER=${DB_USER:-${MYSQL_ENV_DB_USER}}
+  DB_PASS=${DB_PASS:-${MYSQL_ENV_DB_PASS}}
+  DB_NAME=${DB_NAME:-${MYSQL_ENV_DB_NAME}}
+
+  # support for linked orchardup/mysql and centurylink/mysql image
+  DB_USER=${DB_USER:-${MYSQL_ENV_MYSQL_USER}}
+  DB_PASS=${DB_PASS:-${MYSQL_ENV_MYSQL_PASSWORD}}
+  DB_NAME=${DB_NAME:-${MYSQL_ENV_MYSQL_DATABASE}}
 elif [ -n "${POSTGRESQL_PORT_5432_TCP_ADDR}" ]; then
   DB_TYPE=${DB_TYPE:-postgres}
   DB_HOST=${DB_HOST:-${POSTGRESQL_PORT_5432_TCP_ADDR}}
   DB_PORT=${DB_PORT:-${POSTGRESQL_PORT_5432_TCP_PORT}}
+
+  # support for linked sameersbn/postgresql image
+  DB_USER=${DB_USER:-${POSTGRESQL_ENV_DB_USER}}
+  DB_PASS=${DB_PASS:-${POSTGRESQL_ENV_DB_PASS}}
+  DB_NAME=${DB_NAME:-${POSTGRESQL_ENV_DB_NAME}}
+
+  # support for linked orchardup/postgresql image
+  DB_USER=${DB_USER:-${POSTGRESQL_ENV_POSTGRESQL_USER}}
+  DB_PASS=${DB_PASS:-${POSTGRESQL_ENV_POSTGRESQL_PASS}}
+  DB_NAME=${DB_NAME:-${POSTGRESQL_ENV_POSTGRESQL_DB}}
+
+  # support for linked paintedfox/postgresql image
+  DB_USER=${DB_USER:-${POSTGRESQL_ENV_USER}}
+  DB_PASS=${DB_PASS:-${POSTGRESQL_ENV_PASS}}
+  DB_NAME=${DB_NAME:-${POSTGRESQL_ENV_DB}}
 fi
 
-# fallback to using the internal mysql server
-DB_TYPE=${DB_TYPE:-mysql}
-DB_HOST=${DB_HOST:-localhost}
+##
+## For the sake of getting the quick start guide to work,
+## we attempt to spin up a postgresql container if possible.
+##
+## NOTE: this is only meant for getting the quick start guide to work .
+##
+if [ -z "${DB_HOST}" -a -n "$(which docker)" -a -S /var/run/docker.sock ]; then
+  echo "Database connection details not specified."
+  echo "Will try to spin up a new postgresql image with the name postgresql-gitlab."
+  echo "Please manually configure the database connection in production."
+  case "$(docker inspect --format {{.State.Running}} postgresql-gitlab 2>/dev/null)" in
+    true)
+      echo "Using existing postgresql container..."
+      ;;
+    false)
+      echo "Starting up existing postgresql container..."
+      docker start postgresql-gitlab >/dev/null 2>/dev/null
+      ;;
+    *)
+      echo "Starting up a new postgresql container..."
+      docker run --name='postgresql-gitlab' -d \
+        -e 'DB_USER=gitlab_user' -e 'DB_PASS=gitlab_pass' -e 'DB_NAME=gitlab_db' \
+        sameersbn/postgresql:latest >/dev/null 2>/dev/null
+      ;;
+  esac
+  DB_TYPE=postgres
+  DB_HOST=$(docker inspect --format {{.NetworkSettings.IPAddress}} postgresql-gitlab 2>/dev/null)
+  DB_PORT=5432
+  DB_USER=gitlab_user
+  DB_PASS=gitlab_pass
+  DB_NAME=gitlab_db
+fi
+
+if [ -z "${DB_HOST}" ]; then
+  echo "ERROR: "
+  echo "  Please configure the database connection."
+  echo "  Refer http://git.io/wkYhyA for more information."
+  echo "  Cannot continue without a database. Aborting..."
+  exit 1
+fi
 
 # use default port number if it is still not set
 case "${DB_TYPE}" in
   mysql) DB_PORT=${DB_PORT:-3306} ;;
   postgres) DB_PORT=${DB_PORT:-5432} ;;
-  *) echo "Unsupported database adapter. Available adapters are mysql and postgres." && exit 1 ;;
+  *)
+    echo "ERROR: "
+    echo "  Please specify the database type in use via the DB_TYPE configuration option."
+    echo "  Accepted values are \"postgres\" or \"mysql\". Aborting..."
+    exit 1
+    ;;
 esac
+
+# set default user and database
+DB_USER=${DB_USER:-root}
+DB_NAME=${DB_NAME:-gitlabhq_production}
+
+##
+## For the sake of getting the quick start guide to work,
+## we attempt to spin up a redis container if possible.
+##
+## NOTE: this is only meant for getting the quick start guide to work .
+##
+if [ -z "${REDIS_HOST}" -a -n "$(which docker)" -a -S /var/run/docker.sock ]; then
+  echo "Redis connection details not specified."
+  echo "Will try to spin up a new redis image with the name redis-gitlab."
+  echo "Please manually configure the redis connection in production."
+  case "$(docker inspect --format {{.State.Running}} redis-gitlab 2>/dev/null)" in
+    true)
+      echo "Using existing redis container..."
+      ;;
+    false)
+      echo "Starting up existing redis container..."
+      docker start redis-gitlab >/dev/null 2>/dev/null
+      ;;
+    *)
+      echo "Starting up a new redis container..."
+      docker run --name='redis-gitlab' -d sameersbn/redis:latest >/dev/null 2>/dev/null
+      ;;
+  esac
+  REDIS_HOST=$(docker inspect --format {{.NetworkSettings.IPAddress}} redis-gitlab 2>/dev/null)
+  REDIS_PORT=6379
+fi
+
+if [ -z "${REDIS_HOST}" ]; then
+  echo "ERROR: "
+  echo "  Please configure the redis connection."
+  echo "  Refer http://git.io/PMnRSw for more information."
+  echo "  Cannot continue without a redis connection. Aborting..."
+  exit 1
+fi
 
 case "${GITLAB_HTTPS}" in
   true)
@@ -161,9 +274,6 @@ sed -i 's,HostKey /etc/ssh/,HostKey '"${GITLAB_DATA_DIR}"'/ssh/,g' -i /etc/ssh/s
 
 # start supervisord
 /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
-
-echo "Starting openssh server..."
-supervisorctl start sshd >/dev/null
 
 cd ${GITLAB_INSTALL_DIR}
 
@@ -220,49 +330,6 @@ if [ -f "${SSL_CERTIFICATE_PATH}" -o -f "${CA_CERTIFICATES_PATH}" ]; then
   update-ca-certificates --fresh >/dev/null 2>&1
 fi
 
-# start mysql server if ${DB_HOST} is localhost
-if [ "${DB_HOST}" == "localhost" ]; then
-  if [ "${DB_TYPE}" == "postgres" ]; then
-    echo "DB_TYPE 'postgres' is not supported internally. Please provide DB_HOST."
-    exit 1
-  fi
-
-  # fix permissions and ownership of /var/lib/mysql
-  chown -R mysql:mysql /var/lib/mysql
-  chmod 700 /var/lib/mysql
-
-  # initialize MySQL data directory
-  if [ ! -d /var/lib/mysql/mysql ]; then
-    mysql_install_db --user=mysql
-  fi
-
-  echo "Starting mysql server..."
-  supervisorctl start mysqld >/dev/null
-
-  # wait for mysql server to start (max 120 seconds)
-  timeout=120
-  while ! mysqladmin -uroot ${DB_PASS:+-p$DB_PASS} status >/dev/null 2>&1
-  do
-    timeout=$(expr $timeout - 1)
-    if [ $timeout -eq 0 ]; then
-      echo "Failed to start mysql server"
-      exit 1
-    fi
-    sleep 1
-  done
-
-  if ! echo "USE ${DB_NAME}" | mysql -uroot ${DB_PASS:+-p$DB_PASS} >/dev/null 2>&1; then
-    DB_INIT="yes"
-    echo "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET \`utf8\` COLLATE \`utf8_unicode_ci\`;" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
-    echo "GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON \`${DB_NAME}\`.* TO 'root'@'localhost';" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
-  fi
-fi
-
-if [ "${REDIS_HOST}" == "localhost" ]; then
-  echo "Starting redis server..."
-  supervisorctl start redis-server >/dev/null
-fi
-
 # configure git for the 'git' user
 sudo -u git -H git config --global user.name "GitLab"
 sudo -u git -H git config --global user.email "${GITLAB_EMAIL}"
@@ -270,6 +337,7 @@ sudo -u git -H git config --global core.autocrlf input
 
 # configure application paths
 sudo -u git -H sed 's,{{GITLAB_DATA_DIR}},'"${GITLAB_DATA_DIR}"',g' -i config/gitlab.yml
+sudo -u git -H sed 's,{{GITLAB_BACKUP_DIR}},'"${GITLAB_BACKUP_DIR}"',g' -i config/gitlab.yml
 sudo -u git -H sed 's,{{GITLAB_SHELL_INSTALL_DIR}},'"${GITLAB_SHELL_INSTALL_DIR}"',g' -i config/gitlab.yml
 
 # configure gitlab
@@ -279,6 +347,7 @@ sudo -u git -H sed 's/{{GITLAB_HTTPS}}/'"${GITLAB_HTTPS}"'/' -i config/gitlab.ym
 sudo -u git -H sed 's/{{GITLAB_EMAIL}}/'"${GITLAB_EMAIL}"'/' -i config/gitlab.yml
 sudo -u git -H sed 's/{{GITLAB_BACKUP_EXPIRY}}/'"${GITLAB_BACKUP_EXPIRY}"'/' -i config/gitlab.yml
 sudo -u git -H sed 's/{{GITLAB_MAX_SIZE}}/'"${GITLAB_MAX_SIZE}"'/' -i config/gitlab.yml
+sudo -u git -H sed 's/{{GITLAB_SSH_HOST}}/'"${GITLAB_SSH_HOST}"'/' -i config/gitlab.yml
 sudo -u git -H sed 's/{{GITLAB_SSH_PORT}}/'"${GITLAB_SSH_PORT}"'/' -i config/gitlab.yml
 
 # configure gitlab signup configuration
@@ -296,6 +365,12 @@ sudo -u git -H sed 's/{{GITLAB_PROJECTS_VISIBILITY}}/'"${GITLAB_PROJECTS_VISIBIL
 
 # configure gitlab restricted_visibility_levels
 sudo -u git -H sed 's/{{GITLAB_RESTRICTED_VISIBILITY}}/'"${GITLAB_RESTRICTED_VISIBILITY}"'/' -i config/gitlab.yml
+
+# configure gitlab webhook timeout
+sudo -u git -H sed 's/{{GITLAB_WEBHOOK_TIMEOUT}}/'"${GITLAB_WEBHOOK_TIMEOUT}"'/' -i config/gitlab.yml
+
+# configure gravatar support
+sudo -u git -H sed 's/{{GITLAB_GRAVATAR_ENABLED}}/'"${GITLAB_GRAVATAR_ENABLED}"'/' -i config/gitlab.yml
 
 # configure database
 if [ "${DB_TYPE}" == "postgres" ]; then
@@ -328,6 +403,7 @@ sudo -u git -H sed 's/{{REDIS_PORT}}/'"${REDIS_PORT}"'/g' -i config/resque.yml
 # configure gitlab-shell
 sed 's,{{GITLAB_RELATIVE_URL_ROOT}},'"${GITLAB_RELATIVE_URL_ROOT}"',' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
 sudo -u git -H sed 's,{{GITLAB_DATA_DIR}},'"${GITLAB_DATA_DIR}"',g' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
+sudo -u git -H sed 's,{{GITLAB_BACKUP_DIR}},'"${GITLAB_BACKUP_DIR}"',g' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
 sudo -u git -H sed 's/{{SSL_SELF_SIGNED}}/'"${SSL_SELF_SIGNED}"'/' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
 sudo -u git -H sed 's/{{REDIS_HOST}}/'"${REDIS_HOST}"'/' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
 sudo -u git -H sed 's/{{REDIS_PORT}}/'"${REDIS_PORT}"'/' -i ${GITLAB_SHELL_INSTALL_DIR}/config.yml
@@ -452,6 +528,12 @@ sed 's,{{SSL_DHPARAM_PATH}},'"${SSL_DHPARAM_PATH}"',' -i /etc/nginx/sites-enable
 sed 's/{{NGINX_MAX_UPLOAD_SIZE}}/'"${NGINX_MAX_UPLOAD_SIZE}"'/' -i /etc/nginx/sites-enabled/gitlab
 sed 's/{{NGINX_X_FORWARDED_PROTO}}/'"${NGINX_X_FORWARDED_PROTO}"'/' -i /etc/nginx/sites-enabled/gitlab
 
+if [ "${GITLAB_HTTPS_HSTS_ENABLED}" == "true" ]; then
+  sed 's/{{GITLAB_HTTPS_HSTS_MAXAGE}}/'"${GITLAB_HTTPS_HSTS_MAXAGE}"'/' -i /etc/nginx/sites-enabled/gitlab
+else
+  sed '/{{GITLAB_HTTPS_HSTS_MAXAGE}}/d' -i /etc/nginx/sites-enabled/gitlab
+fi
+
 # configure relative_url_root
 if [ -n "${GITLAB_RELATIVE_URL_ROOT}" ]; then
   sed 's,{{GITLAB_RELATIVE_URL_ROOT}},'"${GITLAB_RELATIVE_URL_ROOT}"',' -i /etc/nginx/sites-enabled/gitlab
@@ -490,8 +572,8 @@ chown git:git ${GITLAB_DATA_DIR}/gitlab-satellites
 rm -rf ${GITLAB_DATA_DIR}/cache
 
 # create the backups directory
-sudo -u git -H mkdir -p ${GITLAB_DATA_DIR}/backups/
-chown git:git ${GITLAB_DATA_DIR}/backups/
+sudo -u git -H mkdir -p ${GITLAB_BACKUP_DIR}
+chown git:git ${GITLAB_BACKUP_DIR}
 
 # create the uploads directory
 sudo -u git -H mkdir -p ${GITLAB_DATA_DIR}/uploads/
@@ -506,13 +588,52 @@ chmod 600 ${GITLAB_DATA_DIR}/.ssh/authorized_keys
 chown -R git:git ${GITLAB_DATA_DIR}/.ssh
 
 appStart () {
+  echo "Starting cron..."
+  supervisorctl start cron >/dev/null
+
+  echo "Starting openssh server..."
+  supervisorctl start sshd >/dev/null
+
   echo "Starting nginx..."
   supervisorctl start nginx >/dev/null
 
-  # reset the database if the --db-init switch was given.
-  if [ "$DB_INIT" == "yes" ]; then
-    echo "Initializing database..."
-    sudo -u git -H force=yes bundle exec rake gitlab:setup RAILS_ENV=production
+  # due to the nature of docker and its use cases, we allow some time
+  # for the database server to come online.
+  case "${DB_TYPE}" in
+    mysql)
+      prog="mysqladmin -h ${DB_HOST} -u ${DB_USER} ${DB_PASS:+-p$DB_PASS} status"
+      ;;
+    postgres)
+      prog=$(find /usr/lib/postgresql/ -name pg_isready)
+      prog="${prog} -h ${DB_HOST} -U ${DB_USER} -d ${DB_NAME} -t 1"
+      ;;
+  esac
+  timeout=60
+  while ! ${prog} >/dev/null 2>&1
+  do
+    timeout=$(expr $timeout - 1)
+    if [ $timeout -eq 0 ]; then
+      echo "Could not connect to mysql server. Aborting..."
+      exit 1
+    fi
+    echo "Waiting for database server to accept connections..."
+    sleep 1
+  done
+
+  # run the `gitlab:setup` rake task if required
+  case "${DB_TYPE}" in
+    mysql)
+      QUERY="SELECT count(*) FROM information_schema.tables WHERE table_schema = '${DB_NAME}';"
+      COUNT=$(mysql -h ${DB_HOST} -u ${DB_USER} ${DB_PASS:+-p$DB_PASS} -ss -e "${QUERY}")
+      ;;
+    postgres)
+      QUERY="SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';"
+      COUNT=$(PGPASSWORD="${DB_PASS}" psql -h ${DB_HOST} -U ${DB_USER} -d ${DB_NAME} -Atw -c "${QUERY}" 2>/dev/null)
+      ;;
+  esac
+  if [ -z "${COUNT}" -o ${COUNT} -eq 0 ]; then
+    echo "Setting up GitLab for firstrun. Please be patient, this could take a while..."
+    sudo -u git -H force=yes bundle exec rake gitlab:setup RAILS_ENV=production >/dev/null
   fi
 
   # migrate database and compile the assets if the gitlab version has changed.
@@ -521,7 +642,7 @@ appStart () {
   [ -f tmp/cache/VERSION ] && CACHE_VERSION=$(cat tmp/cache/VERSION)
   if [ "${GITLAB_VERSION}" != "${CACHE_VERSION}" ]; then
     echo "Migrating database..."
-    sudo -u git -H bundle exec rake db:migrate RAILS_ENV=production 2>/dev/null
+    sudo -u git -H bundle exec rake db:migrate RAILS_ENV=production >/dev/null
 
     # recreate the tmp directory
     rm -rf ${GITLAB_DATA_DIR}/tmp
@@ -569,6 +690,20 @@ EOF
   tail -F /var/log/nginx/gitlab_access.log
 }
 
+appStop() {
+  echo ""
+  /etc/init.d/gitlab stop
+  echo "Stopping crond..."
+  supervisorctl stop cron >/dev/null
+  echo "Stopping sshd..."
+  supervisorctl stop sshd >/dev/null
+  echo "Stopping nginx..."
+  supervisorctl stop nginx >/dev/null
+  echo "Stopping supervisord..."
+  kill -15 $(cat /var/run/supervisord.pid)
+  exit
+}
+
 appSanitize () {
   echo "Checking repository directories permissions..."
   chmod -R ug+rwX,o-rwx ${GITLAB_DATA_DIR}/repositories/
@@ -600,19 +735,19 @@ appRake () {
 
   if [ "$1" == "gitlab:backup:restore" ]; then
     # user needs to select the backup to restore
-    nBackups=$(ls ${GITLAB_DATA_DIR}/backups/*_gitlab_backup.tar | wc -l)
+    nBackups=$(ls ${GITLAB_BACKUP_DIR}/*_gitlab_backup.tar | wc -l)
     if [ $nBackups -eq 0 ]; then
       echo "No backup present. Cannot continue restore process.".
       return 1
     fi
 
-    for b in `ls ${GITLAB_DATA_DIR}/backups/ | sort -r`
+    for b in `ls ${GITLAB_BACKUP_DIR} | sort -r`
     do
       echo " ├ $b"
     done
     read -p "Select a backup to restore: " file
 
-    if [ ! -f "${GITLAB_DATA_DIR}/backups/${file}" ]; then
+    if [ ! -f "${GITLAB_BACKUP_DIR}/${file}" ]; then
       echo "Specified backup does not exist. Aborting..."
       return 1
     fi
